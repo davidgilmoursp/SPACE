@@ -4797,9 +4797,10 @@ class RecoveredBuild:
     build_state: str | None
 
 
-# The decision-table branch a plant took, keyed on what it held when the daemon
-# restarted and what it holds after recovery, each as (catalog row, digest
-# directory). With the precondition fixed, every branch ends in its own state.
+# The decision-table branch a plant took, keyed on the fault the fixture gave it
+# and what it holds after recovery, each as (catalog row, digest directory). A
+# row-less plant the tick decides before the restart keeps its planted value.
+# With the precondition fixed, every branch ends in its own state.
 _RECOVERY_OUTCOMES = {
     ((True, True), (True, True)): "confirmed",
     ((False, True), (True, True)): "registered",
@@ -4810,7 +4811,7 @@ _RECOVERY_OUTCOMES = {
 
 
 def recovery_outcome(held: tuple[bool, bool], digest: str, after: RecoveredBuild) -> str:
-    """The branch a plant holding `held` at restart took, from its state after recovery.
+    """The branch a plant given the fault `held` took, from its state after recovery.
 
     A row counts when `space-tmplmgr get` answers for it at all; a row beside
     its directory must be `ready`. `untouched` is a plant other than a
@@ -4839,10 +4840,19 @@ class StartupRecoveryAssertions:
     the node. So the scenario plants one throwaway build per branch of the
     table on the sandbox-pool worker that is *not* running its sandbox, puts
     each into the on-disk/catalog state that branch handles, and restarts that
-    worker's template-manager once. Each plant's outcome follows from what it
-    held at the restart and what it holds after recovery: its `sha256:*`
+    worker's template-manager once. Each plant's outcome follows from the fault
+    the fixture gave it and what it holds after recovery: its `sha256:*`
     directories on disk and the daemon's `space-tmplmgr get` answer (safe here
     because the plants have no cluster release, so a miss cannot re-pull).
+
+    The GC tick applies recovery's check to build directories without a row
+    (`reconcile_rowless_build_dirs`): on the running daemon every
+    `SPACE_TEMPLATE_GC_INTERVAL_SECS`, and on the restarted one from its first
+    tick, which starts beside startup recovery. So the tick rather than the
+    startup pass may adopt or remove a row-less plant, before or after the
+    restart; both run the same check, so the outcome is the same whichever
+    decides. Plants with a row reach recovery's check only through the
+    restart.
 
     Recovery is over once the stale plant's row is gone: rows whose bytes are
     missing are pruned in one pass after every digest directory has been
@@ -4871,7 +4881,8 @@ class StartupRecoveryAssertions:
         self._node: str | None = None
         self._pod: str | None = None
         self._plants: dict[str, PlantedBuild] = {}
-        # What each plant holds when the daemon restarts: (catalog row, digest directory).
+        # The fault the fixture gave each plant: (catalog row, digest directory).
+        # A row-less plant the tick decides before the restart keeps its planted value.
         self._held: dict[str, tuple[bool, bool]] = {}
         self._recovered: dict[str, RecoveredBuild] = {}
 
@@ -4968,16 +4979,33 @@ class StartupRecoveryAssertions:
         )
         self._held[planted.name] = (True, False)
 
-    def orphan(self, planted: PlantedBuild) -> None:
-        """Bytes kept, row gone — the state a crash between rename and DB commit leaves."""
+    def orphan(self, planted: PlantedBuild, *, decided: str = "registered") -> None:
+        """Bytes kept, row gone — the state a crash between rename and DB commit leaves.
+
+        The adapter's orphaning fails unless the row was deleted and the bytes
+        are back in place. From then on the running daemon's GC tick may
+        already apply recovery's check to them (see the class docstring), so
+        the read that follows may find the plant untouched or already in
+        `decided`, the outcome its branch leaves; any other state fails here.
+        """
 
         node = self._current_node()
         self._control.orphan_template_digest_dir(node, planted.name, planted.digest)
-        self._fixture.verify(
-            self._control.template_digest_dirs(node, planted.name) == (planted.digest,),
-            "the digest directory did not survive being orphaned",
-            template=planted.name,
+        now = RecoveredBuild(
+            self._control.template_digest_dirs(node, planted.name),
+            self._control.template_build_state(node, planted.name, planted.digest),
         )
+        outcome = recovery_outcome((False, True), planted.digest, now)
+        self._fixture.verify(
+            outcome in ("untouched", decided),
+            "orphaning left the plant in a state its branch does not leave",
+            template=planted.name,
+            expected=decided,
+            outcome=outcome,
+            digest_dirs=list(now.digest_dirs),
+            build_state=now.build_state,
+        )
+        self._fixture.record(f"orphaned_{planted.case}", outcome)
         self._held[planted.name] = (False, True)
 
     def tamper(self, planted: PlantedBuild) -> None:
@@ -4987,7 +5015,7 @@ class StartupRecoveryAssertions:
         # row-less bytes first lets background recovery register them before
         # the later corruption, which defeats this fixture's precondition.
         self._control.corrupt_template_rootfs(self._current_node(), planted.name, planted.digest)
-        self.orphan(planted)
+        self.orphan(planted, decided="rejected")
 
     def drift(self, planted: PlantedBuild, *, bytes_removed: int = 4096) -> None:
         """Row kept, but the artifact on disk is shorter than the manifest declares."""

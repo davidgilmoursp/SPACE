@@ -11,15 +11,20 @@ import space_smoke as smoke
 # catalog row vouches for it. A `template_builds` row is the validity signal
 # that lets the common case skip the hash.
 #
-# One restart proves the whole table. The scenario plants five small throwaway
+# One restart drives the whole table. The scenario plants five small throwaway
 # builds on the sandbox-pool worker that is *not* running its sandbox, puts
 # each into the state one branch handles, and deletes that worker's
 # template-manager pod once. Each branch leaves its plant in a state no other
 # branch could, read from disk and `space-tmplmgr get`; the stale plant's
-# prune, which follows the whole digest-directory pass, marks the end. The
-# plants have no cluster release, so a miss there cannot re-pull and the
-# negative checks mean something. A rejection's reason is free text; each
-# rejected plant differs from a kept one only in its artifact's bytes or size.
+# prune, which follows the whole digest-directory pass, marks the end. The GC
+# tick applies the same check to row-less directories, on the running daemon
+# and from the restarted daemon's first tick, so it may decide the orphan and
+# tamper plants instead of the startup pass, with the same outcome; those two
+# branches prove that check whichever runs it. The plants with a row reach it
+# only through the restart. The plants have no cluster release, so a miss there
+# cannot re-pull and the negative checks mean something. A rejection's reason
+# is free text; each rejected plant differs from a kept one only in its
+# artifact's bytes or size.
 #
 # States are made without touching the daemon's SQLite: "no row" is produced
 # by stashing the digest directory, running the daemon's own `delete-template`
